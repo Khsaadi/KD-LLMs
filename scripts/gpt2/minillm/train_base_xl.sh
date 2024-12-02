@@ -1,10 +1,10 @@
 #! /bin/bash
 
 MASTER_ADDR=localhost
-MASTER_PORT=${2-2012}
+MASTER_PORT=${2-2021}
 NNODES=1
 NODE_RANK=0
-GPUS_PER_NODE=${3-16}
+GPUS_PER_NODE=1
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --nnodes $NNODES \
@@ -22,11 +22,11 @@ TEACHER_CKPT="${BASE_PATH}/results/gpt2/train/sft/gpt2-xlarge/"
 PROMPT_DATA_DIR="${BASE_PATH}/processed_data/dolly/prompt/gpt2/"
 LM_DATA_DIR="${BASE_PATH}/processed_data/openwebtext/gpt2/512/10M/"
 # runtime
-SAVE_PATH="${BASE_PATH}/results/gpt2/train/minillm/"
+SAVE_PATH="${BASE_PATH}/results/gpt2/train/lastthreelayers/"
 # hp
 GRAD_ACC=1
-BATCH_SIZE=16
-CHUNK_SIZE=16
+BATCH_SIZE=4
+CHUNK_SIZE=4
 
 
 OPTS=""
@@ -49,9 +49,21 @@ OPTS+=" --num-workers 0"
 OPTS+=" --epochs 10"
 OPTS+=" --total-iters 5000"
 OPTS+=" --kd-ratio 0.5"
+OPTS+=" --alpha-corr 0.05"
+OPTS+=" --alpha-cos 0.00"
+OPTS+=" --alpha-mse 0.00"
 OPTS+=" --batch-size ${BATCH_SIZE}"
 OPTS+=" --lr 5e-6"
+#OPTS+=" --lr 1e-6"
+#OPTS+=" --lr-min 1e-6"
 OPTS+=" --lr-min 5e-6"
+OPTS+=" --student-layer-indices [-1,-2,-3]"
+OPTS+=" --teacher-layer-indices [-1,-2,-3]"
+#OPTS+=" --layer-index -1"
+OPTS+=" --student-mlp-size 3072"
+OPTS+=" --student-hidd-size 768"
+#OPTS+=" --mlp"
+OPTS+=" --hidden"
 OPTS+=" --gradient-accumulation-steps ${GRAD_ACC}"
 OPTS+=" --max-length 512"
 OPTS+=" --max-prompt-length 256"
@@ -61,12 +73,21 @@ OPTS+=" --save ${SAVE_PATH}"
 OPTS+=" --seed 10"
 OPTS+=" --seed-ppo 42"
 OPTS+=" --seed-lm 7"
+#OPTS+=" --seed 100"
+#OPTS+=" --seed-ppo 420"
+#OPTS+=" --seed-lm 70"
+
+#OPTS+=" --save-interval 500"
+#OPTS+=" --eval-interval 100"
 OPTS+=" --save-interval 500"
-OPTS+=" --eval-interval 100"
+OPTS+=" --eval-interval 500"
 OPTS+=" --log-interval 16"
 OPTS+=" --mid-log-num 1"
 # ppo
 OPTS+=" --type minillm"
+#OPTS+=" --method nothing"
+#OPTS+=" --method max_activations"
+OPTS+=" --method grad"
 OPTS+=" --ppo-epochs 4"
 OPTS+=" --num-rollouts 256"
 OPTS+=" --chunk-size ${CHUNK_SIZE}"
@@ -84,7 +105,7 @@ OPTS+=" --top-p 1.0"
 OPTS+=" --temperature 1.0"
 # deepspeed
 OPTS+=" --deepspeed"
-OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config.json"
+OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config_test.json"
 
 export NCCL_DEBUG=""
 export WANDB_DISABLED=True
