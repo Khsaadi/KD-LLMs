@@ -15,48 +15,32 @@ import math
 from functools import partial
 from transformers import PreTrainedTokenizerBase
 from .patch import *
+from ..utils import  get_log_probs
 
 
-
-
-
-def compute_interp_loss(layer_index, output_student, output_teacher): # assumption layer index is the last layer then we move on
-            # compute the gradient of the teacher output with the respect to the last layer
-            # compute the gradient of the student output with respect to the last layer mybe multple times to make sure that it is consistent ... think
-            # loss can be mean square error between the 
-            return 
 
 class KnowledgeNeurons:
     def __init__(
         self,
+        max_length,
+        args,
         model: nn.Module,
-        tokenizer: PreTrainedTokenizerBase,
-        model_type: str = "bert",
         device: str = None,
     ):
+        self.args = args
         self.model = model
-        self.model_type = model_type
+        self.max_length = max_length
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.model.to(self.device)
-        self.tokenizer = tokenizer
+        # self.tokenizer = tokenizer
 
         self.baseline_activations = None
-
-        if self.model_type == "bert":
-            self.transformer_layers_attr = "bert.encoder.layer"
-            self.input_ff_attr = "intermediate"
-            self.output_ff_attr = "output.dense.weight"
-            self.word_embeddings_attr = "bert.embeddings.word_embeddings.weight"
-            self.unk_token = getattr(self.tokenizer, "unk_token_id", None)
-        elif "gpt" in model_type:
-            self.transformer_layers_attr = "transformer.h"
-            self.input_ff_attr = "mlp.c_fc"
-            self.output_ff_attr = "mlp.c_proj.weight"
-            self.word_embeddings_attr = "transformer.wpe"
-        else:
-            raise NotImplementedError
+        self.transformer_layers_attr = "transformer.h"
+        self.input_ff_attr = "mlp.c_fc"
+        self.output_ff_attr = "mlp.c_proj.weight"
+        self.word_embeddings_attr = "transformer.wpe"
 
     def _get_output_ff_layer(self, layer_idx):
         return get_ff_layer(
@@ -80,77 +64,12 @@ class KnowledgeNeurons:
     def _get_transformer_layers(self):
         return get_attributes(self.model, self.transformer_layers_attr)
 
-    def _prepare_inputs(self, prompt, target=None, encoded_input=None):
-        if encoded_input is None:
-            encoded_input = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        if self.model_type == "bert":
-            mask_idx = torch.where(
-                encoded_input["input_ids"][0] == self.tokenizer.mask_token_id
-            )[0].item()
-        else:
-            # with autoregressive models we always want to target the last token
-            mask_idx = -1
-        if target is not None:
-            if "gpt" in self.model_type:
-                target = self.tokenizer.encode(target)
-            else:
-                target = self.tokenizer.convert_tokens_to_ids(target)
-        return encoded_input, mask_idx, target
 
-    def _generate(self, prompt, ground_truth):
-        encoded_input, mask_idx, target_label = self._prepare_inputs(
-            prompt, ground_truth
-        )
-        # for autoregressive models, we might want to generate > 1 token
-        if self.model_type == "gpt":
-            n_sampling_steps = len(target_label)
-        else:
-            n_sampling_steps = 1  # TODO: we might want to use multiple mask tokens even with bert models
-
-        all_gt_probs = []
-        all_argmax_probs = []
-        argmax_tokens = []
-        argmax_completion_str = ""
-
-        for i in range(n_sampling_steps):
-            if i > 0:
-                # retokenize new inputs
-                encoded_input, mask_idx, target_label = self._prepare_inputs(
-                    prompt, ground_truth
-                )
-            outputs = self.model(**encoded_input)
-            probs = F.softmax(outputs.logits[:, mask_idx, :], dim=-1)
-            if n_sampling_steps > 1:
-                target_idx = target_label[i]
-            else:
-                target_idx = target_label
-            gt_prob = probs[:, target_idx].item()
-            all_gt_probs.append(gt_prob)
-
-            # get info about argmax completion
-            argmax_prob, argmax_id = [i.item() for i in probs.max(dim=-1)]
-            argmax_tokens.append(argmax_id)
-            argmax_str = self.tokenizer.decode([argmax_id])
-            all_argmax_probs.append(argmax_prob)
-
-            prompt += argmax_str
-            argmax_completion_str += argmax_str
-
-        gt_prob = math.prod(all_gt_probs) if len(all_gt_probs) > 1 else all_gt_probs[0]
-        argmax_prob = (
-            math.prod(all_argmax_probs)
-            if len(all_argmax_probs) > 1
-            else all_argmax_probs[0]
-        )
-        return gt_prob, argmax_prob, argmax_completion_str, argmax_tokens
 
     def n_layers(self):
         return len(self._get_transformer_layers())
 
     def intermediate_size(self):
-        if self.model_type == "bert":
-            return self.model.config.intermediate_size
-        else:
             return self.model.config.hidden_size * 4
 
     @staticmethod
@@ -164,16 +83,17 @@ class KnowledgeNeurons:
         `steps`: int
         number of steps to take
         """
-        tiled_activations = einops.repeat(activations, "b d -> (r b) d", r=steps)
-        out = (
-            tiled_activations
-            * torch.linspace(start=0, end=1, steps=steps).to(device)[:, None]
-        )
+        tiled_activations = einops.repeat(activations, "b d -> (r b) d ", r=steps)
+        scaling = torch.linspace(start=0, end=1, steps=steps).to(device)
+        scaling = scaling.repeat_interleave(int(tiled_activations.size(0)/steps))[:, None]
+        out = tiled_activations * scaling
+        # out = (
+        #     tiled_activations
+        #     * torch.linspace(start=0, end=1, steps=steps).to(device)[:, None]
+        # )
         return out
-
-    def get_baseline_with_activations(
-        self, encoded_input: dict, layer_idx: int, mask_idx: int
-    ):
+    
+    def get_baseline_with_activations_1(self, encoded_input: dict, layer_idx: int, start: int, end: int):
         """
         Gets the baseline outputs and activations for the unmodified model at a given index.
 
@@ -185,14 +105,14 @@ class KnowledgeNeurons:
             the position at which to get the activations (TODO: rename? with autoregressive models there's no mask, so)
         """
 
-        def get_activations(model, layer_idx, mask_idx):
+        def get_activations(model, layer_idx, start, end):
             """
             This hook function should assign the intermediate activations at a given layer / mask idx
             to the 'self.baseline_activations' variable
             """
 
             def hook_fn(acts):
-                self.baseline_activations = acts[:, mask_idx, :]
+                self.baseline_activations = acts[:, start:end, :]
 
             return register_hook(
                 model,
@@ -202,19 +122,101 @@ class KnowledgeNeurons:
                 ff_attrs=self.input_ff_attr,
             )
 
-        handle = get_activations(self.model, layer_idx=layer_idx, mask_idx=mask_idx)
-        baseline_outputs = self.model(**encoded_input)
+        handle = get_activations(self.model, layer_idx=layer_idx, start=start, end=end)
+        with torch.no_grad():
+             baseline_outputs = self.model(**encoded_input,output_hidden_states=True)
+        #grad = torch.autograd.grad(baseline_outputs.logits, baseline_outputs.hidden_states[-1],grad_outputs=torch.ones_like(baseline_outputs.logits), retain_graph=True)[0]
+        handle.remove()
+        baseline_activations = self.baseline_activations
+        self.baseline_activations = None
+        return baseline_outputs, baseline_activations
+    
+    def get_baseline_with_activations(self, encoded_input: dict, layer_idx: int, start: int):
+        """
+        Gets the baseline outputs and activations for the unmodified model at a given index.
+
+        `encoded_input`: torch.Tensor
+            the inputs to the model from self.tokenizer.encode_plus()
+        `layer_idx`: int
+            which transformer layer to access
+        `mask_idx`: int
+            the position at which to get the activations (TODO: rename? with autoregressive models there's no mask, so)
+        """
+
+        def get_activations(model, layer_idx, start):
+            """
+            This hook function should assign the intermediate activations at a given layer / mask idx
+            to the 'self.baseline_activations' variable
+            """
+
+            def hook_fn(acts):
+                self.baseline_activations = acts[:, start, :]
+
+            return register_hook(
+                model,
+                layer_idx=layer_idx,
+                f=hook_fn,
+                transformer_layers_attr=self.transformer_layers_attr,
+                ff_attrs=self.input_ff_attr,
+            )
+
+        handle = get_activations(self.model, layer_idx=layer_idx, start=start)
+        baseline_outputs = self.model(**encoded_input,output_hidden_states=True)
+        #grad = torch.autograd.grad(baseline_outputs.logits, baseline_outputs.hidden_states[-1],grad_outputs=torch.ones_like(baseline_outputs.logits), retain_graph=True)[0]
         handle.remove()
         baseline_activations = self.baseline_activations
         self.baseline_activations = None
         return baseline_outputs, baseline_activations
 
+    # def get_baseline_with_activations(
+    #     self, encoded_input: dict, layer_idx: int, mask_idx: int
+    # ):
+    #     """
+    #     Gets the baseline outputs and activations for the unmodified model at a given index.
+
+    #     `encoded_input`: torch.Tensor
+    #         the inputs to the model from self.tokenizer.encode_plus()
+    #     `layer_idx`: int
+    #         which transformer layer to access
+    #     `mask_idx`: int
+    #         the position at which to get the activations (TODO: rename? with autoregressive models there's no mask, so)
+    #     """
+
+    #     def get_activations(model, layer_idx, mask_idx):
+    #         """
+    #         This hook function should assign the intermediate activations at a given layer / mask idx
+    #         to the 'self.baseline_activations' variable
+    #         """
+
+    #         def hook_fn(acts):
+    #             self.baseline_activations = acts[:, mask_idx, :]
+
+    #         return register_hook(
+    #             model,
+    #             layer_idx=layer_idx,
+    #             f=hook_fn,
+    #             transformer_layers_attr=self.transformer_layers_attr,
+    #             ff_attrs=self.input_ff_attr,
+    #         )
+
+    #     handle = get_activations(self.model, layer_idx=layer_idx, mask_idx=mask_idx)
+    #     baseline_outputs = self.model(**encoded_input)
+    #     handle.remove()
+    #     baseline_activations = self.baseline_activations
+    #     self.baseline_activations = None
+    #     return baseline_outputs, baseline_activations
+
     def get_scores(
         self,
-        prompt: str,
-        ground_truth: str,
-        batch_size: int = 10,
-        steps: int = 20,
+        tokenizer,
+        batch,
+        query_ids, 
+        inf_mask, 
+        response_ids,
+        # encoded_input,
+        batch_size: int = 16,
+        # steps: int = 20,
+        steps: int = 16,
         attribution_method: str = "integrated_grads",
         pbar: bool = True,
     ):
@@ -232,316 +234,184 @@ class KnowledgeNeurons:
             the method to use for getting the scores. Choose from 'integrated_grads' or 'max_activations'.
         """
 
+        mlp_scores = []
+        hidd_scores = []
         scores = []
-        encoded_input = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        for layer_idx in tqdm(
-            range(self.n_layers()),
-            desc="Getting attribution scores for each layer...",
-            disable=not pbar,
-        ):
-            layer_scores = self.get_scores_for_layer(
-                prompt,
-                ground_truth,
-                encoded_input=encoded_input,
-                layer_idx=layer_idx,
-                batch_size=batch_size,
-                steps=steps,
-                attribution_method=attribution_method,
-            )
-            scores.append(layer_scores)
-        return torch.stack(scores)
+        # for layer_idx in tqdm(
+        #     range(self.n_layers()),
+        #     desc="Getting attribution scores for each layer...",
+        #     disable=not pbar,
+        # ):
+        import ast
+        teacher_layer_indices = ast.literal_eval(self.args.teacher_layer_indices)
+        baseline_outputs = self.model(**batch,output_hidden_states=True)
+        if (self.args.mlp == True and self.args.hidden == True):
+            for layer_idx in teacher_layer_indices:
+                hidden_layer_scores , mlp_layer_scores= self.get_scores_for_layer(
+                    # batch,
+                    baseline_outputs,
+                    tokenizer,
+                    query_ids, 
+                    inf_mask, 
+                    response_ids,
+                    layer_idx=layer_idx,
+                    batch_size=batch_size,
+                    steps=steps,
+                    encoded_input=batch,
 
-
-
-    def get_coarse_neurons(
-        self,
-        prompt: str,
-        ground_truth: str,
-        batch_size: int = 10,
-        steps: int = 20,
-        threshold: float = None,
-        adaptive_threshold: float = None,
-        percentile: float = None,
-        attribution_method: str = "integrated_grads",
-        pbar: bool = True,
-    ) -> List[List[int]]:
-        """
-        Finds the 'coarse' neurons for a given prompt and ground truth.
-        The coarse neurons are the neurons that are most activated by a single prompt.
-        We refine these by using multiple prompts that express the same 'fact'/relation in different ways.
-
-        `prompt`: str
-            the prompt to get the coarse neurons for
-        `ground_truth`: str
-            the ground truth / expected output
-        `batch_size`: int
-            batch size
-        `steps`: int
-            total number of steps (per token) for the integrated gradient calculations
-        `threshold`: float
-            `t` from the paper. If not None, then we only keep neurons with integrated grads above this threshold.
-        `adaptive_threshold`: float
-            Adaptively set `threshold` based on `maximum attribution score * adaptive_threshold` (in the paper, they set adaptive_threshold=0.3)
-        `percentile`: float
-            If not None, then we only keep neurons with integrated grads in this percentile of all integrated grads.
-        `attribution_method`: str
-            the method to use for getting the scores. Choose from 'integrated_grads' or 'max_activations'.
-        """
-        attribution_scores = self.get_scores(
-            prompt,
-            ground_truth,
-            batch_size=batch_size,
-            steps=steps,
-            pbar=pbar,
-            attribution_method=attribution_method,
-        )
-        assert (
-            sum(e is not None for e in [threshold, adaptive_threshold, percentile]) == 1
-        ), f"Provide one and only one of threshold / adaptive_threshold / percentile"
-        if adaptive_threshold is not None:
-            threshold = attribution_scores.max().item() * adaptive_threshold
-        if threshold is not None:
-            return torch.nonzero(attribution_scores > threshold).cpu().tolist()
+                    attribution_method=attribution_method,
+                )
+                mlp_scores.append(mlp_layer_scores)
+                hidd_scores.append(hidden_layer_scores)
+            #return torch.stack(mlp_scores), torch.stack(hidd_scores)
+            return mlp_scores, hidd_scores
         else:
-            s = attribution_scores.flatten().detach().cpu().numpy()
-            return (
-                torch.nonzero(attribution_scores > np.percentile(s, percentile))
-                .cpu()
-                .tolist()
-            )
+            for layer_idx in teacher_layer_indices:
+                layer_scores = self.get_scores_for_layer(
+                    # batch,
+                    baseline_outputs,
+                    tokenizer,
+                    query_ids, 
+                    inf_mask, 
+                    response_ids,
+                    layer_idx=layer_idx,
+                    batch_size=batch_size,
+                    steps=steps,
+                    encoded_input=batch,
 
+                    attribution_method=attribution_method,
+                )
+                scores.append(layer_scores)
+        
+            #return torch.stack(scores)
+            return scores
 
-
-    def get_refined_neurons(
-        self,
-        prompts: List[str],
-        ground_truth: str,
-        p: float = 0.5,
-        batch_size: int = 10,
-        steps: int = 20,
-        coarse_adaptive_threshold: Optional[float] = 0.3,
-        coarse_threshold: Optional[float] = None,
-        coarse_percentile: Optional[float] = None,
-        quiet=False,
-    ) -> List[List[int]]:
-        """
-        Finds the 'refined' neurons for a given set of prompts and a ground truth / expected output.
-
-        The input should be n different prompts, each expressing the same fact in different ways.
-        For each prompt, we calculate the attribution scores of each intermediate neuron.
-        We then set an attribution score threshold, and we keep the neurons that are above this threshold.
-        Finally, considering the coarse neurons from all prompts, we set a sharing percentage threshold, p,
-        and retain only neurons shared by more than p% of prompts.
-
-        `prompts`: list of str
-            the prompts to get the refined neurons for
-        `ground_truth`: str
-            the ground truth / expected output
-        `negative_examples`: list of str
-            Optionally provide a list of negative examples. Any neuron that appears in these examples will be excluded from the final results.
-        `p`: float
-            the threshold for the sharing percentage
-        `batch_size`: int
-            batch size
-        `steps`: int
-            total number of steps (per token) for the integrated gradient calculations
-        `coarse_threshold`: float
-            threshold for the coarse neurons
-        `coarse_percentile`: float
-            percentile for the coarse neurons
-        """
-        assert isinstance(
-            prompts, list
-        ), "Must provide a list of different prompts to get refined neurons"
-        assert 0.0 <= p < 1.0, "p should be a float between 0 and 1"
-        refined_neurons = get_coarse_neurons(
-                ground_truth,
-                batch_size=batch_size,
-                steps=steps,
-                adaptive_threshold=coarse_adaptive_threshold,
-                threshold=coarse_threshold,
-                percentile=coarse_percentile,
-                pbar=False,
-            )
-        return refined_neurons
-
-    
-
-
-    # def get_coarse_neurons(
+    # def get_scores(
     #     self,
-    #     prompt: str,
-    #     ground_truth: str,
-    #     batch_size: int = 10,
-    #     steps: int = 20,
-    #     threshold: float = None,
-    #     adaptive_threshold: float = None,
-    #     percentile: float = None,
+    #     tokenizer,
+    #     batch,
+    #     query_ids, 
+    #     inf_mask, 
+    #     response_ids,
+    #     # encoded_input,
+    #     batch_size: int = 16,
+    #     # steps: int = 20,
+    #     steps: int = 16,
     #     attribution_method: str = "integrated_grads",
     #     pbar: bool = True,
-    # ) -> List[List[int]]:
+    # ):
     #     """
-    #     Finds the 'coarse' neurons for a given prompt and ground truth.
-    #     The coarse neurons are the neurons that are most activated by a single prompt.
-    #     We refine these by using multiple prompts that express the same 'fact'/relation in different ways.
-
+    #     Gets the attribution scores for a given prompt and ground truth.
     #     `prompt`: str
-    #         the prompt to get the coarse neurons for
+    #         the prompt to get the attribution scores for
     #     `ground_truth`: str
     #         the ground truth / expected output
     #     `batch_size`: int
     #         batch size
     #     `steps`: int
     #         total number of steps (per token) for the integrated gradient calculations
-    #     `threshold`: float
-    #         `t` from the paper. If not None, then we only keep neurons with integrated grads above this threshold.
-    #     `adaptive_threshold`: float
-    #         Adaptively set `threshold` based on `maximum attribution score * adaptive_threshold` (in the paper, they set adaptive_threshold=0.3)
-    #     `percentile`: float
-    #         If not None, then we only keep neurons with integrated grads in this percentile of all integrated grads.
     #     `attribution_method`: str
     #         the method to use for getting the scores. Choose from 'integrated_grads' or 'max_activations'.
     #     """
-    #     attribution_scores = self.get_scores(
-    #         prompt,
-    #         ground_truth,
-    #         batch_size=batch_size,
-    #         steps=steps,
-    #         pbar=pbar,
-    #         attribution_method=attribution_method,
-    #     )
-    #     assert (
-    #         sum(e is not None for e in [threshold, adaptive_threshold, percentile]) == 1
-    #     ), f"Provide one and only one of threshold / adaptive_threshold / percentile"
-    #     if adaptive_threshold is not None:
-    #         threshold = attribution_scores.max().item() * adaptive_threshold
-    #     if threshold is not None:
-    #         return torch.nonzero(attribution_scores > threshold).cpu().tolist()
-    #     else:
-    #         s = attribution_scores.flatten().detach().cpu().numpy()
-    #         return (
-    #             torch.nonzero(attribution_scores > np.percentile(s, percentile))
-    #             .cpu()
-    #             .tolist()
-    #         )
 
-
-
-    
-
-    # def get_refined_neurons(
-    #     self,
-    #     prompts: List[str],
-    #     ground_truth: str,
-    #     negative_examples: Optional[List[str]] = None,
-    #     p: float = 0.5,
-    #     batch_size: int = 10,
-    #     steps: int = 20,
-    #     coarse_adaptive_threshold: Optional[float] = 0.3,
-    #     coarse_threshold: Optional[float] = None,
-    #     coarse_percentile: Optional[float] = None,
-    #     quiet=False,
-    # ) -> List[List[int]]:
-    #     """
-    #     Finds the 'refined' neurons for a given set of prompts and a ground truth / expected output.
-
-    #     The input should be n different prompts, each expressing the same fact in different ways.
-    #     For each prompt, we calculate the attribution scores of each intermediate neuron.
-    #     We then set an attribution score threshold, and we keep the neurons that are above this threshold.
-    #     Finally, considering the coarse neurons from all prompts, we set a sharing percentage threshold, p,
-    #     and retain only neurons shared by more than p% of prompts.
-
-    #     `prompts`: list of str
-    #         the prompts to get the refined neurons for
-    #     `ground_truth`: str
-    #         the ground truth / expected output
-    #     `negative_examples`: list of str
-    #         Optionally provide a list of negative examples. Any neuron that appears in these examples will be excluded from the final results.
-    #     `p`: float
-    #         the threshold for the sharing percentage
-    #     `batch_size`: int
-    #         batch size
-    #     `steps`: int
-    #         total number of steps (per token) for the integrated gradient calculations
-    #     `coarse_threshold`: float
-    #         threshold for the coarse neurons
-    #     `coarse_percentile`: float
-    #         percentile for the coarse neurons
-    #     """
-    #     assert isinstance(
-    #         prompts, list
-    #     ), "Must provide a list of different prompts to get refined neurons"
-    #     assert 0.0 <= p < 1.0, "p should be a float between 0 and 1"
-
-    #     n_prompts = len(prompts)
-    #     coarse_neurons = []
-    #     for prompt in tqdm(
-    #         prompts, desc="Getting coarse neurons for each prompt...", disable=quiet
-    #     ):
-    #         coarse_neurons.append(
-    #             self.get_coarse_neurons(
-    #                 prompt,
-    #                 ground_truth,
+    #     mlp_scores = []
+    #     hidd_scores = []
+    #     scores = []
+    #     # for layer_idx in tqdm(
+    #     #     range(self.n_layers()),
+    #     #     desc="Getting attribution scores for each layer...",
+    #     #     disable=not pbar,
+    #     # ):
+    #     if (self.args.mlp == True and self.args.hidden == True):
+    #         for layer_idx in [self.args.layer_index]:
+    #             hidden_layer_scores , mlp_layer_scores= self.get_scores_for_layer(
+    #                 # batch,
+    #                 tokenizer,
+    #                 query_ids, 
+    #                 inf_mask, 
+    #                 response_ids,
+    #                 layer_idx=layer_idx,
     #                 batch_size=batch_size,
     #                 steps=steps,
-    #                 adaptive_threshold=coarse_adaptive_threshold,
-    #                 threshold=coarse_threshold,
-    #                 percentile=coarse_percentile,
-    #                 pbar=False,
+    #                 encoded_input=batch,
+
+    #                 attribution_method=attribution_method,
     #             )
-    #         )
-    #     if negative_examples is not None:
-    #         negative_neurons = []
-    #         for negative_example in tqdm(
-    #             negative_examples,
-    #             desc="Getting coarse neurons for negative examples",
-    #             disable=quiet,
-    #         ):
-    #             negative_neurons.append(
-    #                 self.get_coarse_neurons(
-    #                     negative_example,
-    #                     ground_truth,
-    #                     batch_size=batch_size,
-    #                     steps=steps,
-    #                     adaptive_threshold=coarse_adaptive_threshold,
-    #                     threshold=coarse_threshold,
-    #                     percentile=coarse_percentile,
-    #                     pbar=False,
-    #                 )
+    #             mlp_scores.append(mlp_layer_scores)
+    #             hidd_scores.append(hidden_layer_scores)
+    #         return torch.stack(mlp_scores), torch.stack(hidd_scores)
+    #     else:
+    #         for layer_idx in [self.args.layer_index]:
+    #             layer_scores = self.get_scores_for_layer(
+    #                 # batch,
+    #                 tokenizer,
+    #                 query_ids, 
+    #                 inf_mask, 
+    #                 response_ids,
+    #                 layer_idx=layer_idx,
+    #                 batch_size=batch_size,
+    #                 steps=steps,
+    #                 encoded_input=batch,
+
+    #                 attribution_method=attribution_method,
     #             )
-    #     if not quiet:
-    #         total_coarse_neurons = sum([len(i) for i in coarse_neurons])
-    #         print(f"\n{total_coarse_neurons} coarse neurons found - refining")
-    #     t = n_prompts * p
-    #     refined_neurons = []
-    #     c = collections.Counter()
-    #     for neurons in coarse_neurons:
-    #         for n in neurons:
-    #             c[tuple(n)] += 1
+    #             scores.append(layer_scores)
+        
+    #         return torch.stack(scores)
 
-    #     for neuron, count in c.items():
-    #         if count > t:
-    #             refined_neurons.append(list(neuron))
 
-    #     # filter out neurons that are in the negative examples
-    #     if negative_examples is not None:
-    #         for neuron in negative_neurons:
-    #             if neuron in refined_neurons:
-    #                 refined_neurons.remove(neuron)
-
-    #     total_refined_neurons = len(refined_neurons)
-    #     if not quiet:
-    #         print(f"{total_refined_neurons} neurons remaining after refining")
-    #     return refined_neurons
-
+    def _prepare_inputs(self, prompt, target=None, encoded_input=None):
+        if encoded_input is None:
+            encoded_input = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        else:
+            # with autoregressive models we always want to target the last token
+            mask_idx = -1
+        if target is not None:
+            target = self.tokenizer.encode(target)
+        return encoded_input, mask_idx, target
+    
+    def get_mask(self, tokenizer, tokens):
+        attention_mask = (
+            tokens.not_equal(tokenizer.pad_token_id).long()
+        )
+        return attention_mask
+    
+    def get_model_inputs(
+        self,
+        tokenizer,
+        query_tensors,
+        response_tensors,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        tokens = torch.cat((query_tensors, response_tensors), dim=1)[
+            :, -self.max_length :
+        ]
+        attention_mask = self.get_mask(tokenizer,tokens)
+  
+        batch = {
+            "input_ids": tokens,
+            "attention_mask": attention_mask
+        }
+        
+        # if self.args.model_type in ["gpt2"]:  
+            # For a proper positional encoding in case of left padding
+        position_ids = attention_mask.cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask.eq(0), 0)
+        batch["position_ids"] = position_ids
+        
+        return batch
+    
     def get_scores_for_layer(
         self,
-        prompt: str,
-        ground_truth: str,
+        # batch,
+        baseline_outputs,
+        tokenizer,
+        query_ids, inf_mask, response_ids,
         layer_idx: int,
-        batch_size: int = 10,
-        steps: int = 20,
+        batch_size: int = 2,
+        # steps: int = 20,
+        steps: int = 16,
         encoded_input: Optional[int] = None,
+        
         attribution_method: str = "integrated_grads",
     ):
         """
@@ -563,400 +433,335 @@ class KnowledgeNeurons:
         """
         assert steps % batch_size == 0
         n_batches = steps // batch_size
-
-        # First we take the unmodified model and use a hook to return the baseline intermediate activations at our chosen target layer
-        encoded_input, mask_idx, target_label = self._prepare_inputs(
-            prompt, ground_truth, encoded_input
-        )
-
-        # for autoregressive models, we might want to generate > 1 token
-        if self.model_type == "gpt":
-            n_sampling_steps = len(target_label)
-        else:
-            n_sampling_steps = 1  # TODO: we might want to use multiple mask tokens even with bert models
-
+        response_tensors = response_ids
+        query_tensors = query_ids
+        response_tensors = einops.repeat(response_tensors, "b d -> (r b) d ", r=batch_size)
+        inf_mask= einops.repeat(inf_mask, "b d c -> (r b) d c", r=batch_size)
         if attribution_method == "integrated_grads":
-            integrated_grads = []
+            start = query_tensors.size(1) - 1
+            end = query_tensors.size(1) + response_tensors.size(1) - 1
+            mask_idx = end-1
+            (  baseline_outputs,
+                baseline_activations,
+            ) = self.get_baseline_with_activations(
+                encoded_input, layer_idx, mask_idx
+            )
+            scaled_weights = self.scaled_input(
+                baseline_activations, steps=steps, device=self.device
+            )
+            scaled_weights.requires_grad_(True)
 
-            for i in range(n_sampling_steps):
-                if i > 0 and self.model_type == "gpt":
-                    # retokenize new inputs
-                    encoded_input, mask_idx, target_label = self._prepare_inputs(
-                        prompt, ground_truth
-                    )
-                (
-                    baseline_outputs,
-                    baseline_activations,
-                ) = self.get_baseline_with_activations(
-                    encoded_input, layer_idx, mask_idx
+            integrated_grads_this_step = []  # to store the integrated gradients
+            #n_batches = 4
+            all_gradients = []
+            for batch_weights in scaled_weights.chunk(n_batches):
+            
+                inputs = {
+                    "input_ids": einops.repeat(
+                        encoded_input["input_ids"], "b d -> (r b) d", r=batch_size
+                    ),
+                    "attention_mask": einops.repeat(
+                        encoded_input["attention_mask"],
+                        "b d -> (r b) d",
+                        r=batch_size,
+                    ),
+                }
+                
+                indices = response_tensors.size(1) - 1
+                patch_ff_layer(
+                    self.model,
+                    mask_idx=mask_idx,
+                    # start = start,
+                    # end = end,
+                    layer_idx=layer_idx,
+                    
+                    replacement_activations=batch_weights,
+                    transformer_layers_attr=self.transformer_layers_attr,
+                    ff_attrs=self.input_ff_attr,
                 )
-                if n_sampling_steps > 1:
-                    argmax_next_token = (
-                        baseline_outputs.logits[:, mask_idx, :].argmax(dim=-1).item()
-                    )
-                    next_token_str = self.tokenizer.decode(argmax_next_token)
-
-                # Now we want to gradually change the intermediate activations of our layer from 0 -> their original value
-                # and calculate the integrated gradient of the masked position at each step
-                # we do this by repeating the input across the batch dimension, multiplying the first batch by 0, the second by 0.1, etc., until we reach 1
-                scaled_weights = self.scaled_input(
-                    baseline_activations, steps=steps, device=self.device
+                outputs = self.model(
+                **inputs,
+                return_dict=True,
+                output_hidden_states=True,
+                use_cache=False
                 )
-                scaled_weights.requires_grad_(True)
 
-                integrated_grads_this_step = []  # to store the integrated gradients
-
-                for batch_weights in scaled_weights.chunk(n_batches):
-                    # we want to replace the intermediate activations at some layer, at the mask position, with `batch_weights`
-                    # first tile the inputs to the correct batch size
-                    inputs = {
-                        "input_ids": einops.repeat(
-                            encoded_input["input_ids"], "b d -> (r b) d", r=batch_size
-                        ),
-                        "attention_mask": einops.repeat(
-                            encoded_input["attention_mask"],
-                            "b d -> (r b) d",
-                            r=batch_size,
-                        ),
-                    }
-                    if self.model_type == "bert":
-                        inputs["token_type_ids"] = einops.repeat(
-                            encoded_input["token_type_ids"],
-                            "b d -> (r b) d",
-                            r=batch_size,
-                        )
-
-                    # then patch the model to replace the activations with the scaled activations
-                    patch_ff_layer(
-                        self.model,
-                        layer_idx=layer_idx,
-                        mask_idx=mask_idx,
-                        replacement_activations=batch_weights,
-                        transformer_layers_attr=self.transformer_layers_attr,
-                        ff_attrs=self.input_ff_attr,
-                    )
-
-                    # then forward through the model to get the logits
-                    outputs = self.model(**inputs)
-
-                    # then calculate the gradients for each step w/r/t the inputs
-                    probs = F.softmax(outputs.logits[:, mask_idx, :], dim=-1)
-                    if n_sampling_steps > 1:
-                        target_idx = target_label[i]
-                    else:
-                        target_idx = target_label
-                    grad = torch.autograd.grad(
-                        torch.unbind(probs[:, target_idx]), batch_weights
+                # then calculate the gradients for each step w/r/t the inputs
+                logits = outputs.logits
+                logits = logits[:, mask_idx, :]
+                probs = F.softmax(logits, dim=-1)
+                #prob = probs[:,response_tensors[:,0]]
+                prob = torch.gather(probs, dim=-1, index=response_tensors[:,end-1-start].unsqueeze(-1)).squeeze(-1)
+                grad = torch.autograd.grad(torch.unbind(prob), batch_weights
                     )[0]
-                    grad = grad.sum(dim=0)
-                    integrated_grads_this_step.append(grad)
+                grad = grad * baseline_activations.squeeze(0) / steps
+                integrated_grads_this_step.append(grad.sum(dim=0))
 
-                    unpatch_ff_layer(
-                        self.model,
-                        layer_idx=layer_idx,
-                        transformer_layers_attr=self.transformer_layers_attr,
-                        ff_attrs=self.input_ff_attr,
-                    )
 
-                # then sum, and multiply by W-hat / m
-                integrated_grads_this_step = torch.stack(
-                    integrated_grads_this_step, dim=0
-                ).sum(dim=0)
-                integrated_grads_this_step *= baseline_activations.squeeze(0) / steps
-                integrated_grads.append(integrated_grads_this_step)
+                unpatch_ff_layer(
+                    self.model,
+                    layer_idx=layer_idx,
+                    transformer_layers_attr=self.transformer_layers_attr,
+                    ff_attrs=self.input_ff_attr,
+                )
 
-                if n_sampling_steps > 1:
-                    prompt += next_token_str
-            integrated_grads = torch.stack(integrated_grads, dim=0).sum(dim=0) / len(
-                integrated_grads
-            )
-            return integrated_grads
+            integrated_grads_this_step = torch.stack(integrated_grads_this_step, dim=0).sum(dim=0) /steps
+            return integrated_grads_this_step # add hidden_state
+    
         elif attribution_method == "max_activations":
-            activations = []
-            for i in range(n_sampling_steps):
-                if i > 0 and self.model_type == "gpt":
-                    # retokenize new inputs
-                    encoded_input, mask_idx, target_label = self._prepare_inputs(
-                        prompt, ground_truth
-                    )
-                (
-                    baseline_outputs,
-                    baseline_activations,
-                ) = self.get_baseline_with_activations(
-                    encoded_input, layer_idx, mask_idx
-                )
-                activations.append(baseline_activations)
-                if n_sampling_steps > 1:
-                    argmax_next_token = (
-                        baseline_outputs.logits[:, mask_idx, :].argmax(dim=-1).item()
-                    )
-                    next_token_str = self.tokenizer.decode(argmax_next_token)
-                    prompt += next_token_str
-            activations = torch.stack(activations, dim=0).sum(dim=0) / len(activations)
-            return activations.squeeze(0)
-        else:
-            raise NotImplementedError
+            # scores_hidd, scores_mlp = None, None
+            start = query_tensors.size(1) - 1
+            end = query_tensors.size(1) + response_tensors.size(1) - 1
+            output, baseline_activations_mlp = self.get_baseline_with_activations_1(encoded_input, layer_idx, start, end)
+            activations_mlp = baseline_activations_mlp.sum(dim=0)
+            # baseline_activations_hidd = self.get_baseline_with_activations(encoded_input, layer_idx, mask_idx)
+            # activations_hidd = baseline_activations_hidd.sum(dim=0)
+            # add activation of mlp layer
+            return activations_mlp.mean(dim=0)
 
-    def modify_activations(
-        self,
-        prompt: str,
-        ground_truth: str,
-        neurons: List[List[int]],
-        mode: str = "suppress",
-        undo_modification: bool = True,
-        quiet: bool = False,
-    ) -> Tuple[dict, Callable]:
-        results_dict = {}
-        _, mask_idx, _ = self._prepare_inputs(
-            prompt, ground_truth
-        )  # just need to get the mask index for later - probably a better way to do this
-        # get the baseline probabilities of the groundtruth being generated + the argmax / greedy completion before modifying the activations
-        (
-            gt_baseline_prob,
-            argmax_baseline_prob,
-            argmax_completion_str,
-            _,
-        ) = self._generate(prompt, ground_truth)
-        if not quiet:
-            print(
-                f"\nBefore modification - groundtruth probability: {gt_baseline_prob}\nArgmax completion: `{argmax_completion_str}`\nArgmax prob: {argmax_baseline_prob}\n"
-            )
-        results_dict["before"] = {
-            "gt_prob": gt_baseline_prob,
-            "argmax_completion": argmax_completion_str,
-            "argmax_prob": argmax_baseline_prob,
-        }
+        # if attribution_method == "grad":
+        #     # start = query_tensors.size(1) - 1
+        #     # end = query_tensors.size(1) + response_tensors.size(1) - 1
+        #     # baseline_outputs, baseline_activations = self.get_baseline_with_activations_2(encoded_input, layer_idx, start, end)
+        #     baseline_outputs = self.model(**encoded_input,output_hidden_states=True)
+        #     # compute logits my self after the mlp output but fine for now keep only last hidden state
+        #     logits =  baseline_outputs.logits
+        #     mask_idx = -2
+        #     logits = logits[:, mask_idx, :]
+        #     probs = F.softmax(logits, dim=-1)
+        #     prob = torch.gather(probs, dim=-1, index=response_tensors[:,mask_idx].unsqueeze(-1)).squeeze(-1)
+        #     if self.args.hidden and self.args.mlp:
+        #          scores_hidd = torch.autograd.grad(probs, baseline_outputs.hidden_states[-1],grad_outputs=torch.ones_like(probs), retain_graph=True)[0]
+        #          last_layer_mlp = self.model.transformer.h[self.args.layer_index].mlp  # 11
+        #          before_last_hidden_state = baseline_outputs.hidden_states[self.args.layer_index-1]  # 10
+        #          mlp_output = last_layer_mlp.c_fc(before_last_hidden_state)
+        #          scores_mlp = torch.autograd.grad(probs, mlp_output,grad_outputs=torch.ones_like(probs), retain_graph=True)[0] # mlp output
+        #          return scores_hidd, scores_mlp
+        #     if self.args.mlp  and self.args.hidden== False:
+        #          last_layer_mlp = self.model.transformer.h[self.args.layer_index].mlp  # 11
+        #          before_last_hidden_state = baseline_outputs.hidden_states[self.args.layer_index-1]  # 10
+        #          mlp_output = last_layer_mlp.c_fc(before_last_hidden_state)
+        #          scores_mlp = torch.autograd.grad(probs, mlp_output,grad_outputs=torch.ones_like(probs), retain_graph=True)[0] # mlp output
+        #          return scores_mlp
+        #     if self.args.hidden and self.args.mlp== False:
+        #          scores_hidd = torch.autograd.grad(probs, baseline_outputs.hidden_states[-1],grad_outputs=torch.ones_like(probs), retain_graph=True)[0] # mlp output
+        #          return scores_hidd
+        
+        if attribution_method == "grad":
+            # start = query_tensors.size(1) - 1
+            # end = query_tensors.size(1) + response_tensors.size(1) - 1
+            # baseline_outputs, baseline_activations = self.get_baseline_with_activations_2(encoded_input, layer_idx, start, end)
+            # baseline_outputs = self.model(**encoded_input,output_hidden_states=True)
+            # compute logits my self after the mlp output but fine for now keep only last hidden state
+            logits =  baseline_outputs.logits
+            mask_idx = -2
+            logits = logits[:, mask_idx, :]
+            probs = F.softmax(logits, dim=-1)
+            prob = torch.gather(probs, dim=-1, index=response_tensors[:,mask_idx].unsqueeze(-1)).squeeze(-1)
+            if self.args.hidden and self.args.mlp:
+                 scores_hidd = torch.autograd.grad(probs, baseline_outputs.hidden_states[layer_idx],grad_outputs=torch.ones_like(probs), retain_graph=True)[0]
+                 last_layer_mlp = self.model.transformer.h[layer_idx].mlp  # 11
+                 before_last_hidden_state = baseline_outputs.hidden_states[layer_idx-1]  # 10
+                 mlp_output = last_layer_mlp.c_fc(before_last_hidden_state)
+                 scores_mlp = torch.autograd.grad(probs, mlp_output,grad_outputs=torch.ones_like(probs), retain_graph=True)[0] # mlp output
+                 return scores_hidd, scores_mlp
+            if self.args.mlp  and self.args.hidden== False:
+                 last_layer_mlp = self.model.transformer.h[layer_idx].mlp  # 11
+                 before_last_hidden_state = baseline_outputs.hidden_states[layer_idx-1]  # 10
+                 mlp_output = last_layer_mlp.c_fc(before_last_hidden_state)
+                 scores_mlp = torch.autograd.grad(probs, mlp_output,grad_outputs=torch.ones_like(probs), retain_graph=True)[0] # mlp output
+                 return scores_mlp
+            if self.args.hidden and self.args.mlp== False:
+                 scores_hidd = torch.autograd.grad(probs, baseline_outputs.hidden_states[layer_idx],grad_outputs=torch.ones_like(probs), retain_graph=True)[0] # mlp output
+                 return scores_hidd
 
-        # patch model to suppress neurons
-        # store all the layers we patch so we can unpatch them later
-        all_layers = set([n[0] for n in neurons])
+        if attribution_method == "nothing":
+            if self.args.hidden and self.args.mlp:
+                scores_hidd = torch.rand(self.args.student_hidd_size)
+                scores_mlp = torch.rand(self.args.student_mlp_size)
+                return scores_hidd, scores_mlp
+            elif self.args.hidden== True and self.args.mlp==False:
+                return torch.rand(self.args.student_hidd_size)
+            elif self.args.hidden== False and self.args.mlp==True:
+                return torch.rand(self.args.student_mlp_size)
 
-        patch_ff_layer(
-            self.model,
-            mask_idx,
-            mode=mode,
-            neurons=neurons,
-            transformer_layers_attr=self.transformer_layers_attr,
-            ff_attrs=self.input_ff_attr,
-        )
 
-        # get the probabilities of the groundtruth being generated + the argmax / greedy completion after modifying the activations
-        new_gt_prob, new_argmax_prob, new_argmax_completion_str, _ = self._generate(
-            prompt, ground_truth
-        )
-        if not quiet:
-            print(
-                f"\nAfter modification - groundtruth probability: {new_gt_prob}\nArgmax completion: `{new_argmax_completion_str}`\nArgmax prob: {new_argmax_prob}\n"
-            )
-        results_dict["after"] = {
-            "gt_prob": new_gt_prob,
-            "argmax_completion": new_argmax_completion_str,
-            "argmax_prob": new_argmax_prob,
-        }
+        if attribution_method == "gradX":
+            # Forward pass
+            # baseline_outputs = self.model(**encoded_input, output_hidden_states=True)
+            logits = baseline_outputs.logits
+            mask_idx = -2  # Index of the target token in the sequence
+            logits = logits[:, mask_idx, :]
+            probs = F.softmax(logits, dim=-1)
+            prob = torch.gather(probs, dim=-1, index=response_tensors[:, mask_idx].unsqueeze(-1)).squeeze(-1)
 
-        unpatch_fn = partial(
-            unpatch_ff_layers,
-            model=self.model,
-            layer_indices=all_layers,
-            transformer_layers_attr=self.transformer_layers_attr,
-            ff_attrs=self.input_ff_attr,
-        )
+            # Attribution method: Gradient × Input
+            if self.args.hidden and self.args.mlp:
+                # Hidden state attribution
+                hidden_states = baseline_outputs.hidden_states[layer_idx]
+                scores_hidd = torch.autograd.grad(prob, hidden_states, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                grad_times_hidden = scores_hidd * hidden_states  # Gradient × Input for hidden states
 
-        if undo_modification:
-            unpatch_fn()
-            unpatch_fn = lambda *args: args
+                # MLP output attribution
+                last_layer_mlp = self.model.transformer.h[layer_idx].mlp
+                before_last_hidden_state = baseline_outputs.hidden_states[layer_idx - 1]
+                mlp_output = last_layer_mlp.c_fc(before_last_hidden_state)
+                scores_mlp = torch.autograd.grad(prob, mlp_output, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                grad_times_mlp = scores_mlp * mlp_output  # Gradient × Input for MLP output
 
-        return results_dict, unpatch_fn
+                return grad_times_hidden.abs(), grad_times_mlp.abs()
 
-    def suppress_knowledge(
-        self,
-        prompt: str,
-        ground_truth: str,
-        neurons: List[List[int]],
-        undo_modification: bool = True,
-        quiet: bool = False,
-    ) -> Tuple[dict, Callable]:
-        """
-        prompt the model with `prompt`, zeroing the activations at the positions specified by `neurons`,
-        and measure the resulting affect on the ground truth probability.
-        """
-        return self.modify_activations(
-            prompt=prompt,
-            ground_truth=ground_truth,
-            neurons=neurons,
-            mode="suppress",
-            undo_modification=undo_modification,
-            quiet=quiet,
-        )
+            if self.args.mlp and not self.args.hidden:
+                # MLP output attribution only
+                last_layer_mlp = self.model.transformer.h[layer_idx].mlp
+                before_last_hidden_state = baseline_outputs.hidden_states[layer_idx - 1]
+                mlp_output = last_layer_mlp.c_fc(before_last_hidden_state)
+                scores_mlp = torch.autograd.grad(prob, mlp_output, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                grad_times_mlp = scores_mlp * mlp_output  # Gradient × Input for MLP output
+                return grad_times_mlp.abs()
 
-    def enhance_knowledge(
-        self,
-        prompt: str,
-        ground_truth: str,
-        neurons: List[List[int]],
-        undo_modification: bool = True,
-        quiet: bool = False,
-    ) -> Tuple[dict, Callable]:
-        """
-        prompt the model with `prompt`, multiplying the activations at the positions
-        specified by `neurons` by 2, and measure the resulting affect on the ground truth probability.
-        """
-        return self.modify_activations(
-            prompt=prompt,
-            ground_truth=ground_truth,
-            neurons=neurons,
-            mode="enhance",
-            undo_modification=undo_modification,
-            quiet=quiet,
-        )
+            if self.args.hidden and not self.args.mlp:
+                # Hidden state attribution only
+                hidden_states = baseline_outputs.hidden_states[layer_idx]
+                scores_hidd = torch.autograd.grad(prob, hidden_states, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                grad_times_hidden = scores_hidd * hidden_states  # Gradient × Input for hidden states
+                return grad_times_hidden.abs().sum(dim=0).sum(dim=0)
 
-    @torch.no_grad()
-    def modify_weights(
-        self,
-        prompt: str,
-        neurons: List[List[int]],
-        target: str,
-        mode: str = "edit",
-        erase_value: str = "zero",
-        undo_modification: bool = True,
-        quiet: bool = False,
-    ) -> Tuple[dict, Callable]:
-        """
-        Update the *weights* of the neural net in the positions specified by `neurons`.
-        Specifically, the weights of the second Linear layer in the ff are updated by adding or subtracting the value
-        of the word embeddings for `target`.
-        """
-        assert mode in ["edit", "erase"]
-        assert erase_value in ["zero", "unk"]
-        results_dict = {}
+            
+        if attribution_method == "gradXmask":
+            # Forward pass
+            # baseline_outputs = self.model(**encoded_input, output_hidden_states=True)
+            logits = baseline_outputs.logits
+            mask_idx = -2  # Index of the target token in the sequence
+            logits = logits[:, mask_idx, :]
+            probs = F.softmax(logits, dim=-1)
+            prob = torch.gather(probs, dim=-1, index=response_tensors[:, mask_idx].unsqueeze(-1)).squeeze(-1)
 
-        _, _, target_label = self._prepare_inputs(prompt, target)
-        # get the baseline probabilities of the target being generated + the argmax / greedy completion before modifying the weights
-        (
-            gt_baseline_prob,
-            argmax_baseline_prob,
-            argmax_completion_str,
-            argmax_tokens,
-        ) = self._generate(prompt, target)
-        if not quiet:
-            print(
-                f"\nBefore modification - groundtruth probability: {gt_baseline_prob}\nArgmax completion: `{argmax_completion_str}`\nArgmax prob: {argmax_baseline_prob}"
-            )
-        results_dict["before"] = {
-            "gt_prob": gt_baseline_prob,
-            "argmax_completion": argmax_completion_str,
-            "argmax_prob": argmax_baseline_prob,
-        }
+            # Attribution method: Gradient × Input
+            if self.args.hidden and self.args.mlp:
+                # Hidden state attribution
+                hidden_states = baseline_outputs.hidden_states[layer_idx]
+                scores_hidd = torch.autograd.grad(prob, hidden_states, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                grad_times_hidden = scores_hidd * hidden_states  # Gradient × Input for hidden states
 
-        # get the word embedding values of the baseline + target predictions
-        word_embeddings_weights = self._get_word_embeddings()
-        if mode == "edit":
-            assert (
-                self.model_type == "bert"
-            ), "edit mode currently only working for bert models - TODO"
-            original_prediction_id = argmax_tokens[0]
-            original_prediction_embedding = word_embeddings_weights[
-                original_prediction_id
-            ]
-            target_embedding = word_embeddings_weights[target_label]
+                # MLP output attribution
+                last_layer_mlp = self.model.transformer.h[layer_idx].mlp
+                before_last_hidden_state = baseline_outputs.hidden_states[layer_idx - 1]
+                mlp_output = last_layer_mlp.c_fc(before_last_hidden_state)
+                scores_mlp = torch.autograd.grad(prob, mlp_output, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                grad_times_mlp = scores_mlp * mlp_output  # Gradient × Input for MLP output
 
-        if erase_value == "zero":
-            erase_value = 0
-        else:
-            assert self.model_type == "bert", "GPT models don't have an unk token"
-            erase_value = word_embeddings_weights[self.unk_token]
+                return grad_times_hidden.abs(), grad_times_mlp.abs()
 
-        # modify the weights by subtracting the original prediction's word embedding
-        # and adding the target embedding
-        original_weight_values = []  # to reverse the action later
-        for layer_idx, position in neurons:
-            output_ff_weights = self._get_output_ff_layer(layer_idx)
-            if self.model_type == "gpt2":
-                # since gpt2 uses a conv1d layer instead of a linear layer in the ff block, the weights are in a different format
-                original_weight_values.append(
-                    output_ff_weights[position, :].detach().clone()
-                )
-            else:
-                original_weight_values.append(
-                    output_ff_weights[:, position].detach().clone()
-                )
-            if mode == "edit":
-                if self.model_type == "gpt2":
-                    output_ff_weights[position, :] -= original_prediction_embedding * 2
-                    output_ff_weights[position, :] += target_embedding * 2
-                else:
-                    output_ff_weights[:, position] -= original_prediction_embedding * 2
-                    output_ff_weights[:, position] += target_embedding * 2
-            else:
-                if self.model_type == "gpt2":
-                    output_ff_weights[position, :] = erase_value
-                else:
-                    output_ff_weights[:, position] = erase_value
+            if self.args.mlp and not self.args.hidden:
+                # MLP output attribution only
+                last_layer_mlp = self.model.transformer.h[layer_idx].mlp
+                before_last_hidden_state = baseline_outputs.hidden_states[layer_idx - 1]
+                mlp_output = last_layer_mlp.c_fc(before_last_hidden_state)
+                scores_mlp = torch.autograd.grad(prob, mlp_output, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                grad_times_mlp = scores_mlp * mlp_output  # Gradient × Input for MLP output
+                
+                return grad_times_mlp.abs()
 
-        # get the probabilities of the target being generated + the argmax / greedy completion after modifying the weights
-        (
-            new_gt_prob,
-            new_argmax_prob,
-            new_argmax_completion_str,
-            new_argmax_tokens,
-        ) = self._generate(prompt, target)
-        if not quiet:
-            print(
-                f"\nAfter modification - groundtruth probability: {new_gt_prob}\nArgmax completion: `{new_argmax_completion_str}`\nArgmax prob: {new_argmax_prob}"
-            )
-        results_dict["after"] = {
-            "gt_prob": new_gt_prob,
-            "argmax_completion": new_argmax_completion_str,
-            "argmax_prob": new_argmax_prob,
-        }
+            if self.args.hidden and not self.args.mlp:
+                # Hidden state attribution only
+                
+                hidden_states = baseline_outputs.hidden_states[layer_idx]#[:,mask_idx,:]
+                scores_hidd = torch.autograd.grad(prob, hidden_states, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                grad_times_hidden = scores_hidd[:,mask_idx,:] * hidden_states[:,mask_idx,:]  # Gradient × Input for hidden states
+                return grad_times_hidden.abs().sum(dim=0)
 
-        def unpatch_fn():
-            # reverse modified weights
-            for idx, (layer_idx, position) in enumerate(neurons):
-                output_ff_weights = self._get_output_ff_layer(layer_idx)
-                if self.model_type == "gpt2":
-                    output_ff_weights[position, :] = original_weight_values[idx]
-                else:
-                    output_ff_weights[:, position] = original_weight_values[idx]
+            
+        if attribution_method == "gradlogitlens":
+            # Forward pass
+            # baseline_outputs = self.model(**encoded_input, output_hidden_states=True)
+            # logits = baseline_outputs.logits
+            # # mask_idx = -2  # Index of the target token in the sequence
+            # # logits = logits[:, mask_idx, :]
+            # probs = F.softmax(logits, dim=-1)
+            # prob = torch.gather(probs, dim=-1, index=response_tensors[:, mask_idx].unsqueeze(-1)).squeeze(-1)
 
-        if undo_modification:
-            unpatch_fn()
-            unpatch_fn = lambda *args: args
+            # Attribution method: Gradient × Input
+            if self.args.hidden and self.args.mlp:
+                # Hidden state attribution
+                baseline_outputs = self.model(**encoded_input, output_hidden_states=True)
+                logits = baseline_outputs.logits
+                mask_idx = -2  # Index of the target token in the sequence
+                logits = logits[:, mask_idx, :]
+                probs = F.softmax(logits, dim=-1)
+                prob = torch.gather(probs, dim=-1, index=response_tensors[:, mask_idx].unsqueeze(-1)).squeeze(-1)
+                hidden_states = baseline_outputs.hidden_states[layer_idx]
+                scores_hidd = torch.autograd.grad(prob, hidden_states, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                grad_times_hidden = scores_hidd * hidden_states  # Gradient × Input for hidden states
 
-        return results_dict, unpatch_fn
+                # MLP output attribution
+                last_layer_mlp = self.model.transformer.h[layer_idx].mlp
+                before_last_hidden_state = baseline_outputs.hidden_states[layer_idx - 1]
+                mlp_output = last_layer_mlp.c_fc(before_last_hidden_state)
+                scores_mlp = torch.autograd.grad(prob, mlp_output, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                grad_times_mlp = scores_mlp * mlp_output  # Gradient × Input for MLP output
 
-    def edit_knowledge(
-        self,
-        prompt: str,
-        target: str,
-        neurons: List[List[int]],
-        undo_modification: bool = True,
-        quiet: bool = False,
-    ) -> Tuple[dict, Callable]:
-        return self.modify_weights(
-            prompt=prompt,
-            neurons=neurons,
-            target=target,
-            mode="edit",
-            undo_modification=undo_modification,
-            quiet=quiet,
-        )
+                return grad_times_hidden.abs(), grad_times_mlp.abs()
 
-    def erase_knowledge(
-        self,
-        prompt: str,
-        neurons: List[List[int]],
-        erase_value: str = "zero",
-        target: Optional[str] = None,
-        undo_modification: bool = True,
-        quiet: bool = False,
-    ) -> Tuple[dict, Callable]:
-        return self.modify_weights(
-            prompt=prompt,
-            neurons=neurons,
-            target=target,
-            mode="erase",
-            erase_value=erase_value,
-            undo_modification=undo_modification,
-            quiet=quiet,
-        )
+            if self.args.mlp and not self.args.hidden:
+                # MLP output attribution only
+                baseline_outputs = self.model(**encoded_input, output_hidden_states=True)
+                logits = baseline_outputs.logits
+                mask_idx = -2  # Index of the target token in the sequence
+                logits = logits[:, mask_idx, :]
+                probs = F.softmax(logits, dim=-1)
+                prob = torch.gather(probs, dim=-1, index=response_tensors[:, mask_idx].unsqueeze(-1)).squeeze(-1)
+                last_layer_mlp = self.model.transformer.h[layer_idx].mlp
+                before_last_hidden_state = baseline_outputs.hidden_states[layer_idx - 1]
+                mlp_output = last_layer_mlp.c_fc(before_last_hidden_state)
+                scores_mlp = torch.autograd.grad(prob, mlp_output, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                grad_times_mlp = scores_mlp * mlp_output  # Gradient × Input for MLP output
+                
+                return grad_times_mlp.abs()
+
+            if self.args.hidden and not self.args.mlp:
+                # Hidden state attribution only
+                #baseline_outputs = self.model(**encoded_input, output_hidden_states=True)
+                start = query_tensors.size(1) - 1
+                end = query_tensors.size(1) + response_tensors.size(1) - 1
+                # Get hidden states for the specified layer
+                mask_idx = -2
+                hidden_states = baseline_outputs.hidden_states[layer_idx]#[:, mask_idx,:]
+                # Logits computation from hidden states (model's last linear layer)
+                # Assuming the model's final output layer maps hidden states to logits.
+                # In GPT-2, this is done using the lm_head layer (which is a linear layer).
+                # lm_head = self.model.lm_head  # the linear layer to convert hidden states to logits
+                # logits = lm_head(hidden_states)  # shape: (batch_size, sequence_length, vocab_size)
+                logits = baseline_outputs.logits
+                # Get the logits for the target token
+                # mask_idx = -2  # Index of the target token in the sequence (you can adjust this index)
+                # logits = logits[:, mask_idx, :]  # Get logits for the masked token
+                # probs = F.softmax(logits[:,start:end,:], dim=-1)  # Convert logits to probabilities
+                # Extract the probability for the target token (given in response_tensors)
+                curr_grad = torch.zeros_like(hidden_states)
+                # for mask_idx in [start, int((end-start)/2), -2, -1]:
+                for mask_idx in [-2]:
+                #for mask_idx in [0, 1, 50, 400,-3, -2, -1]:
+                    #logits = logits[:, mask_idx, :]  # Get logits for the masked token
+                    probs = F.softmax(logits[:, mask_idx, :], dim=-1)  # Convert logits to probabilities
+                    max_indices = torch.argmax(probs, dim=-1)
+                    #prob = probs[:, max_indices]
+                    #prob = torch.gather(probs, dim=-1, index=response_tensors[:, mask_idx].unsqueeze(-1)).squeeze(-1)
+                    prob = torch.gather(probs, dim=-1, index=max_indices.unsqueeze(-1)).squeeze(-1)
+                    #prob = torch.gather(probs, dim=-1, index=encoded_input["input_ids"][:, mask_idx].unsqueeze(-1)).squeeze(-1)
+                    # Compute the gradients of the probability with respect to the hidden states
+                    #hidden_states.requires_grad_()  # Set hidden states to require gradients
+                    # Perform backward pass to compute gradients
+                    # grads = torch.autograd.grad(prob, hidden_states, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                    grads = torch.autograd.grad(torch.unbind(prob), hidden_states, retain_graph=True)[0]
+                   
+                    grad_times_hidden = grads * hidden_states
+                    curr_grad = curr_grad + grad_times_hidden
+                curr_grad = curr_grad/3
+                # Gradient × Input (Gradients multiplied by the hidden states)
+                # grad_times_hidden = grads * hidden_states  # Element-wise multiplication``
+                return curr_grad.abs()  #.sum(dim=0).sum(dim=0)
+                # hidden_states = baseline_outputs.hidden_states[layer_idx]#[:,mask_idx,:]
+                # scores_hidd = torch.autograd.grad(prob, hidden_states, grad_outputs=torch.ones_like(prob), retain_graph=True)[0]
+                # grad_times_hidden = scores_hidd[:,mask_idx,:] * hidden_states[:,mask_idx,:]  # Gradient × Input for hidden states
+                # return grad_times_hidden.abs().sum(dim=0)

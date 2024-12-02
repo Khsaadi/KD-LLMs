@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 from collections import defaultdict
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.optim import AdamW
@@ -38,7 +39,7 @@ from .losses import Loss
 
 from utils import print_rank, save_rank, get_rank, all_gather, save_parallel
 from rouge_metric import compute_metrics
-
+from minillm.knowledge_neurons.knowledge_neurons import KnowledgeNeurons
 
 class PPOTrainer():
     """
@@ -226,6 +227,64 @@ class PPOTrainer():
             return logits, logprobs
 
         return logits
+    def off_diagonal(self,x):
+        # return a flattened view of the off-diagonal elements of a square matrix
+        n, m = x.shape
+        assert n == m
+        return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+    
+    def compute_corr(self, x, y, model_batch):                      
+        mask = model_batch["attention_mask"].unsqueeze(-1).expand_as(x).float()  # (bs, seq_length, dim)
+        mask = mask.type(torch.ByteTensor).to(self.device)
+        assert x.size() == y.size()
+        dim = y.size(-1)
+        mlp_output_stu_slct = torch.masked_select(x, mask)  # (bs * seq_length * dim)
+        z1 = mlp_output_stu_slct.view(-1, dim)  # (bs * seq_length, dim)
+        important_features_slct = torch.masked_select(y, mask)  # (bs * seq_length * dim)
+        z2 = important_features_slct.view(-1, dim)  # (bs * seq_length, dim)
+        z1_norm = (z1 - torch.mean(z1, dim=0)) / torch.std(z1, dim=0)
+        z2_norm = (z2 - torch.mean(z2, dim=0)) / torch.std(z2, dim=0)
+        cross_corr = torch.matmul(z1_norm.float().T, z2_norm.float()) / important_features_slct.size(0)
+        on_diag = torch.diagonal(cross_corr).add_(-1).pow_(2).sum()
+        off_diag = self.off_diagonal(cross_corr).pow_(2).sum()
+        # loss_corr = on_diag + (5e-3 * off_diag)
+        corr = 0.005*on_diag + off_diag
+        return corr
+    
+    def compute_mse(self, x, y, model_batch):  
+        mask = model_batch["attention_mask"].unsqueeze(-1).expand_as(x).float()  # (bs, seq_length, dim)
+        mask = mask.type(torch.ByteTensor).to(self.device)
+        assert x.size() == y.size()
+        dim = y.size(-1)
+        mlp_output_stu_slct = torch.masked_select(x, mask)  # (bs * seq_length * dim)
+        z1 = mlp_output_stu_slct.view(-1, dim)  # (bs * seq_length, dim)
+        important_features_slct = torch.masked_select(y, mask)  # (bs * seq_length * dim)
+        z2 = important_features_slct.view(-1, dim)  # (bs * seq_length, dim)
+        # euclidian dist
+        #mse = torch.norm(z1 -z2, p=2)
+        mse = torch.mean(torch.abs(z1 - z2) / (torch.abs(z1) + torch.abs(z2) + 1e-8))
+        # z1_norm = (z1 - torch.mean(z1, dim=0)) / torch.std(z1, dim=0)
+        # z2_norm = (z2 - torch.mean(z2, dim=0)) / torch.std(z2, dim=0)
+
+        # mse = F.mse_loss(z1_norm, z2_norm)                  
+        return mse
+
+    def compute_cos(self, x, y, model_batch):  
+        mask = model_batch["attention_mask"].unsqueeze(-1).expand_as(x).float()  # (bs, seq_length, dim)
+        mask = mask.type(torch.ByteTensor).to(self.device)
+        assert x.size() == y.size()
+        dim = y.size(-1)
+        mlp_output_stu_slct = torch.masked_select(x, mask)  # (bs * seq_length * dim)
+        z1 = mlp_output_stu_slct.view(-1, dim)  # (bs * seq_length, dim)
+        important_features_slct = torch.masked_select(y, mask)  # (bs * seq_length * dim)
+        z2 = important_features_slct.view(-1, dim)  # (bs * seq_length, dim)
+        # z1_norm = (z1 - torch.mean(z1, dim=0)) / torch.std(z1, dim=0)
+        # z2_norm = (z2 - torch.mean(z2, dim=0)) / torch.std(z2, dim=0)
+        # target = z1.new(z1.size(0)).fill_(1)
+        # cosine_loss_fct = nn.CosineEmbeddingLoss(reduction="mean")
+        # cos = cosine_loss_fct(z1, z2, target) 
+        cos = torch.mean(1- F.cosine_similarity(z1, z2, dim =-1))                 
+        return cos
 
     def train(self):
         """
@@ -237,16 +296,16 @@ class PPOTrainer():
         self.global_iter_count = 1
         self.nth_evaluation = 0
 
-        self.evaluate()
+        #self.evaluate()
 
         print_rank("Total Steps:", self.total_steps, "Data Epochs:", self.args.epochs)
         lm_epochs = 0        
         logging_stats = defaultdict(float)
-
-        # for training_epoch in range(self.args.training_epochs):
-        for training_epoch in range(1):
-            # for ppo_epoch in range(self.n_updates_per_batch):
-            for ppo_epoch in range(1):
+        KN = KnowledgeNeurons(self.max_length, self.args, self.teacher_model)
+        for training_epoch in range(self.args.training_epochs):
+        #for training_epoch in range(1):
+            for ppo_epoch in range(self.n_updates_per_batch):
+            #for ppo_epoch in range(1):
                 for it, batch in enumerate(self.train_dataloader):
                     if self.lm_pipeline is not None:
                         try:
@@ -283,10 +342,166 @@ class PPOTrainer():
                     # compute lm-related loss on pre-training data
                     pt_loss, pt_loss_stats = self.losses.pt_loss(lm_batch, lm_logits)
                     stats.update(pt_loss_stats)
-                    ft_loss, ft_loss_stats = self.losses.ft_loss(batch)      
-                    stats.update(ft_loss_stats)         
-                    loss = rl_loss + ft_loss + self.args.lm_coef * pt_loss
+                    # query_tensors = batch.query_tensors
+                    # response_tensors = batch.response_tensors
+                    # batch = self.get_model_inputs(query_tensors, response_tensors)
+                    # ft_loss, ft_loss_stats = self.losses.ft_loss(batch_ft, student_model= self.model) 
+                    # ft_loss, ft_loss_stats = self.losses.ft_loss(batch,KN, student_model= self.model, device = self.device) 
+                        # important_features = teacher_outputs.hidden_states[-1][0, :, top_k_indices] # problem here
+                    # if self.args.mlp == True and self.args.hidden == True:
+                    #     important_mlp_features, important_hidden_features, model_batch = self.losses.ft_loss(batch,KN) 
+                    #     student_output = self.model(**model_batch, output_hidden_states=True)
+                    #     #stu_last_hiiden_state = student_output.hidden_states[-1]
+                    #     last_layer_mlp_stu = self.model.module.base_model.transformer.h[self.args.layer_index].mlp
+                    #     before_last_hidden_state_stu = student_output.hidden_states[self.args.layer_index-1]
+                    #     mlp_output_stu = last_layer_mlp_stu.c_fc(before_last_hidden_state_stu)  
+                    #     #stu_last_hiiden_state = mlp_output_stu
+                    #     if self.args.alpha_corr: 
+                    #         mlp_corr_loss = self.args.alpha_corr*self.compute_corr(mlp_output_stu, important_mlp_features, model_batch)
+                    #         hidd_corr_loss = self.args.alpha_corr*self.compute_corr(student_output.hidden_states[self.args.layer_index], important_hidden_features, model_batch)
+                    #     if self.args.alpha_mse: 
+                    #         mlp_corr_loss = self.args.alpha_mse*self.compute_mse(mlp_output_stu, important_mlp_features,model_batch)
+                    #         hidd_corr_loss = self.args.alpha_mse*self.compute_mse(student_output.hidden_states[self.args.layer_index], important_hidden_features, model_batch)
+                    #     if self.args.alpha_cos: 
+                    #         mlp_corr_loss = self.args.alpha_cos*self.compute_cos(mlp_output_stu, important_mlp_features, model_batch)
+                    #         hidd_corr_loss = self.args.alpha_cos*self.compute_cos(student_output.hidden_states[self.args.layer_index], important_hidden_features, model_batch)
+                    #     ft_loss= mlp_corr_loss + hidd_corr_loss
+                        
+                    #     curr_stats_ft = {}
+                    #     curr_stats_ft["ft_loss"] = ft_loss
+                    #     ft_loss_stats = curr_stats_ft
+                    #     stats.update(ft_loss_stats)
+
+                    # if self.args.mlp == True and self.args.hidden == False:
+                    #     important_mlp_features, model_batch = self.losses.ft_loss(batch,KN) 
+                                                
+                    #     student_output = self.model(**model_batch, output_hidden_states=True)
+                    #     #stu_last_hiiden_state = student_output.hidden_states[-1]
+                    #     last_layer_mlp_stu = self.model.module.base_model.transformer.h[self.args.layer_index].mlp
+                    #     before_last_hidden_state_stu = student_output.hidden_states[self.args.layer_index-1]
+                    #     mlp_output_stu = last_layer_mlp_stu.c_fc(before_last_hidden_state_stu)  
+                    #     #stu_last_hiiden_state = mlp_output_stu
+                    #     if self.args.alpha_corr: 
+                    #         mlp_loss = self.args.alpha_corr*self.compute_corr(mlp_output_stu, important_mlp_features, model_batch)
+                    #     if self.args.alpha_mse: 
+                    #         mlp_loss = self.args.alpha_mse*self.compute_mse(mlp_output_stu, important_mlp_features, model_batch)
+                    #     if self.args.alpha_cos: 
+                    #         mlp_loss = self.args.alpha_cos*self.compute_cos(mlp_output_stu, important_mlp_features, model_batch)
+                    #     ft_loss = mlp_loss
+                        
+                    #     curr_stats_ft = {}
+                    #     curr_stats_ft["ft_loss"] = ft_loss
+                    #     ft_loss_stats = curr_stats_ft
+                    #     stats.update(ft_loss_stats)
+
+                    # if self.args.hidden == True and self.args.mlp == False:
+                    #     important_hidden_features, model_batch = self.losses.ft_loss(batch,KN) 
+                    #     student_output = self.model(**model_batch, output_hidden_states=True)
+                    #     if self.args.alpha_corr: 
+                    #         hidd_corr_loss = self.args.alpha_corr*self.compute_corr(student_output.hidden_states[self.args.layer_index], important_hidden_features, model_batch)
+                    #     if self.args.alpha_mse: 
+                    #         hidd_corr_loss = self.args.alpha_mse*self.compute_mse(student_output.hidden_states[self.args.layer_index], important_hidden_features, model_batch)
+                    #     if self.args.alpha_cos: 
+                    #         hidd_corr_loss = self.args.alpha_cos*self.compute_cos(student_output.hidden_states[self.args.layer_index], important_hidden_features, model_batch)
+                    #     ft_loss = hidd_corr_loss
+
+                    #     curr_stats_ft = {}
+                    #     curr_stats_ft["ft_loss"] = ft_loss
+                    #     ft_loss_stats = curr_stats_ft
+                    #     stats.update(ft_loss_stats)
+
+                    import ast
+                    student_layer_indices = ast.literal_eval(self.args.student_layer_indices)
+                    if self.args.mlp == True and self.args.hidden == True:
+                        important_mlp_features, important_hidden_features, model_batch = self.losses.ft_loss(batch,KN) 
+                        student_output = self.model(**model_batch, output_hidden_states=True)
+                        #stu_last_hiiden_state = student_output.hidden_states[-1]
+                        global_ft_loss = 0
+                        for j in range(len(student_layer_indices)):
+                            ft_loss = 0
+                            last_layer_mlp_stu = self.model.module.base_model.transformer.h[student_layer_indices[j]].mlp
+                            before_last_hidden_state_stu = student_output.hidden_states[student_layer_indices[j]-1]
+                            mlp_output_stu = last_layer_mlp_stu.c_fc(before_last_hidden_state_stu)  
+                            #stu_last_hiiden_state = mlp_output_stu
+                            if self.args.alpha_corr: 
+                                mlp_corr_loss = self.compute_corr(mlp_output_stu, important_mlp_features[j], model_batch)
+                                hidd_corr_loss = self.compute_corr(student_output.hidden_states[student_layer_indices[j]], important_hidden_features[[j]], model_batch)
+                            if self.args.alpha_mse: 
+                                mlp_corr_loss = self.compute_mse(mlp_output_stu, important_mlp_features[j],model_batch)
+                                hidd_corr_loss = self.compute_mse(student_output.hidden_states[student_layer_indices[j]], important_hidden_features[j], model_batch)
+                            if self.args.alpha_cos: 
+                                mlp_corr_loss = self.compute_cos(mlp_output_stu, important_mlp_features[j], model_batch)
+                                hidd_corr_loss = self.compute_cos(student_output.hidden_states[[j]], important_hidden_features[j], model_batch)
+                            ft_loss= mlp_corr_loss + hidd_corr_loss
+                            global_ft_loss = global_ft_loss + ft_loss
+                        curr_stats_ft = {}
+                        curr_stats_ft["ft_loss"] = global_ft_loss
+                        ft_loss_stats = curr_stats_ft
+                        stats.update(ft_loss_stats)
+
+                    if self.args.mlp == True and self.args.hidden == False:
+                        important_mlp_features, model_batch = self.losses.ft_loss(batch,KN) 
+                                                
+                        student_output = self.model(**model_batch, output_hidden_states=True)
+                        global_ft_loss = 0
+                        for j in range(len(student_layer_indices)):
+                            ft_loss = 0
+                            #stu_last_hiiden_state = student_output.hidden_states[-1]
+                            last_layer_mlp_stu = self.model.module.base_model.transformer.h[student_layer_indices[j]].mlp
+                            before_last_hidden_state_stu = student_output.hidden_states[student_layer_indices[j]-1]
+                            mlp_output_stu = last_layer_mlp_stu.c_fc(before_last_hidden_state_stu)  
+                            #stu_last_hiiden_state = mlp_output_stu
+                            if self.args.alpha_corr: 
+                                mlp_loss = self.compute_corr(mlp_output_stu, important_mlp_features[j], model_batch)
+                            if self.args.alpha_mse: 
+                                mlp_loss = self.compute_mse(mlp_output_stu, important_mlp_features[j], model_batch)
+                            if self.args.alpha_cos: 
+                                mlp_loss = self.compute_cos(mlp_output_stu, important_mlp_features[j], model_batch)
+                            ft_loss = mlp_loss
+                            global_ft_loss = global_ft_loss + ft_loss
+                            
+                        curr_stats_ft = {}
+                        curr_stats_ft["ft_loss"] = global_ft_loss
+                        ft_loss_stats = curr_stats_ft
+                        stats.update(ft_loss_stats)
+
+                    if self.args.hidden == True and self.args.mlp == False:
+                        
+                        important_hidden_features, model_batch = self.losses.ft_loss(batch,KN) 
+                        student_output = self.model(**model_batch, output_hidden_states=True)
+                     
+                        global_ft_loss = 0
+                        for j in range(len(student_layer_indices)):
+                            curr_ft_loss = 0
+                            if self.args.alpha_corr: 
+                                hidd_corr_loss = self.args.alpha_corr*self.compute_corr(student_output.hidden_states[student_layer_indices[j]], important_hidden_features[j], model_batch)
+                            if self.args.alpha_mse: 
+                                hidd_corr_loss = self.args.alpha_mse*self.compute_mse(student_output.hidden_states[student_layer_indices[j]], important_hidden_features[j], model_batch)
+                            if self.args.alpha_cos: 
+                                hidd_corr_loss = self.args.alpha_cos*self.compute_cos(student_output.hidden_states[student_layer_indices [j]], important_hidden_features[j], model_batch)
+                            curr_ft_loss = hidd_corr_loss
+                            global_ft_loss = global_ft_loss + curr_ft_loss
+                        global_ft_loss = global_ft_loss/3
+                        curr_stats_ft = {}
+                        curr_stats_ft["ft_loss"] = global_ft_loss
+                        ft_loss_stats = curr_stats_ft
+                        stats.update(ft_loss_stats)
+
+
+
+
+
+
+
+                    #stats.update(ft_loss_stats)   
+                    if self.args.mlp == True or self.args.hidden == True:     
+                        loss = rl_loss + global_ft_loss + self.args.lm_coef * pt_loss
+                    if self.args.mlp == False and self.args.hidden == False:
+                        loss = rl_loss + self.args.lm_coef * pt_loss      
+                    #loss = rl_loss + ft_loss + self.args.lm_coef * pt_loss
+                    #loss = rl_loss + self.args.lm_coef * pt_loss
                     stats["tot_loss"] = loss.item()
+                    # loss = rl_loss + self.args.lm_coef * pt_loss
                     forward_time = time() - forward_time
 
                     # Compute the second part of the loss and start from the last layer of the teacher.
@@ -361,7 +576,7 @@ class PPOTrainer():
 
                     # Logging
                     def get_log(log_stats, one_step_time):
-                        keys = ["tot_loss", "rl_loss", "pt_loss", "pg_loss", "reg_loss", "reward", "rev_kl", "stu_lens", "mixed_lens"]
+                        keys = ["tot_loss", "rl_loss", "pt_loss", "pg_loss", "reg_loss", "reward", "rev_kl", "stu_lens", "mixed_lens", "ft_loss"]
                         prefix = "train | data_epochs {:2d}/{:2d} | inner iter: {:3d}/{:3d} | ppo epoch: {:2d}/{:2d} | global iter: {:6d}/{:6d}".format(
                             self.sampler.epochs,
                             self.args.epochs,
@@ -457,6 +672,8 @@ class PPOTrainer():
         eval_results = {}
         eval_rl_results, preds, response_texts = self.evaluate_ppo()
         eval_results.update(eval_rl_results)
+        # eval_ft_results, preds, response_texts = self.evaluate_ft()
+        # eval_results.update(eval_ft_results)
         eval_pt_results = self.evaluate_pt()
         eval_results.update(eval_pt_results)
         
@@ -472,6 +689,7 @@ class PPOTrainer():
                 eval_log_str += "| {}: {:.3f} ".format(key, eval_results[key])
             print_rank(eval_log_str)
             save_rank(eval_log_str, os.path.join(self.args.save, "log.txt"))
+
 
     def evaluate_ppo(self):  # noqa: C901
         # self.model.eval()
@@ -568,6 +786,30 @@ class PPOTrainer():
 
         self.nth_evaluation += 1
         return stats, table, response_texts
+
+    # def evaluate_ft(self):
+    #     ft_losses = []
+    #     for batch in tqdm(self.eval_lm_dataloader, desc="LM Evaluation", disable=(not get_rank() == 0)):
+    #         self.eval_lm_pipeline.move_to_device(*batch, self.device)
+    #         model_batch, _ = batch
+    #         outputs = self.model(**model_batch, return_dict=True, use_cache=False)
+    #         logits = outputs.logits
+    #         with torch.no_grad():
+    #             _, stats = self.losses.pt_loss(batch, logits)
+    #             all_pt_losses.append(stats["pt_loss"])
+    #             all_lm_losses.append(stats["lm_loss"])
+    #             all_kd_losses.append(stats["ds_loss"])
+        
+    #     all_pt_losses = torch.tensor(all_pt_losses, device=self.device)
+    #     eval_pt_loss = all_gather(all_pt_losses, dim=0, world_size=self.dp_world_size, group=self.dp_group).mean().item()
+        
+    #     all_lm_losses = torch.tensor(all_lm_losses, device=self.device)
+    #     eval_lm_loss = all_gather(all_lm_losses, dim=0, world_size=self.dp_world_size, group=self.dp_group).mean().item()
+        
+    #     all_kd_losses = torch.tensor(all_kd_losses, device=self.device)
+    #     eval_kd_loss = all_gather(all_kd_losses, dim=0, world_size=self.dp_world_size, group=self.dp_group).mean().item()
+    #     return 
+
 
     def evaluate_pt(self):
         all_pt_losses = []

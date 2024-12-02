@@ -44,9 +44,12 @@ def add_runtime_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group('runtime', 'runtime configurations')
 
     group.add_argument("--type", type=str, default=None)
+    group.add_argument("--method", type=str, default=None)
     group.add_argument("--do-train", action="store_true")
     group.add_argument("--do-valid", action="store_true")
     group.add_argument("--do-eval", action="store_true")
+    group.add_argument("--mlp", action="store_true")
+    group.add_argument("--hidden", action="store_true")
     group.add_argument('--base-path', type=str, default=None, help='Path to the project base directory.')
     group.add_argument('--load', type=str, default=None,
                        help='Path to a directory containing a model checkpoint.')
@@ -100,6 +103,16 @@ def add_hp_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group("hp", "hyper parameter configurations")
     group.add_argument('--batch-size', type=int, default=32,
                        help='Data Loader batch size')
+    #group.add_argument('--layer-index', type=int, default=-1,
+                       #help='layer index')
+    group.add_argument('--student-layer-indices', type=str, default=[-1],
+                        help='Layer indices as a list (e.g., [-1, -2])')
+    group.add_argument('--teacher-layer-indices', type=str, default=[-1],
+                        help='Layer indices as a list (e.g., [-1, -2])')
+    group.add_argument('--student-mlp-size', type=int, default=-1,
+                       help='student-mlp-size')
+    group.add_argument('--student-hidd-size', type=int, default=-1,
+                       help='student hidden size')
     group.add_argument('--eval-batch-size', type=int, default=32,
                        help='Data Loader batch size')
     group.add_argument('--clip-grad', type=float, default=1.0,
@@ -130,7 +143,9 @@ def add_hp_args(parser: argparse.ArgumentParser):
     group.add_argument('--loss-scale', type=float, default=65536,
                        help='loss scale')
     group.add_argument("--kd-ratio", type=float, default=None)
-
+    group.add_argument("--alpha-corr", type=float, default=None)
+    group.add_argument("--alpha-mse", type=float, default=None)
+    group.add_argument("--alpha-cos", type=float, default=None)
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '
                        'training iters). Default 0.01')

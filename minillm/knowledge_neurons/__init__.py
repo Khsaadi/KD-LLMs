@@ -6,7 +6,7 @@ from transformers import (
     GPTNeoForCausalLM,
 )
 from .knowledge_neurons import KnowledgeNeurons
-from .data import pararel, pararel_expanded, PARAREL_RELATION_NAMES
+# from .data import pararel, pararel_expanded, PARAREL_RELATION_NAMES
 
 BERT_MODELS = ["bert-base-uncased", "bert-base-multilingual-uncased"]
 GPT2_MODELS = ["gpt2"]

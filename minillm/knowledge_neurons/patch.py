@@ -104,6 +104,8 @@ class Patch(torch.nn.Module):
         self,
         ff_layer: nn.Module,
         mask_idx: int,
+        # start: int,
+        # end: int,
         replacement_activations: torch.Tensor = None,
         target_positions: List[List[int]] = None,
         mode: str = "replace",
@@ -113,6 +115,8 @@ class Patch(torch.nn.Module):
         self.ff = ff_layer
         self.acts = replacement_activations
         self.mask_idx = mask_idx
+        # self.start = start,
+        # self.end =  end,
         self.target_positions = target_positions
         self.enhance_value = enhance_value
         assert mode in ["replace", "suppress", "enhance"]
@@ -126,6 +130,8 @@ class Patch(torch.nn.Module):
         x = self.ff(x)
         if self.mode == "replace":
             x[:, self.mask_idx, :] = self.acts
+        # if self.mode == "replace":
+        #       x[:, self.start[0]:self.end[0], :] = self.acts
         elif self.mode == "suppress":
             for pos in self.target_positions:
                 x[:, self.mask_idx, pos] = 0.0
@@ -140,6 +146,8 @@ class Patch(torch.nn.Module):
 def patch_ff_layer(
     model: nn.Module,
     mask_idx: int,
+    # start: int,
+    # end: int,
     layer_idx: int = None,
     replacement_activations: torch.Tensor = None,
     mode: str = "replace",
@@ -180,6 +188,8 @@ def patch_ff_layer(
             Patch(
                 ff_layer,
                 mask_idx,
+                # start, 
+                # end,
                 replacement_activations=replacement_activations,
                 mode=mode,
             ),
