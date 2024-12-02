@@ -1,10 +1,4 @@
-# MiniLLM: Knowledge Distillation of Large Language Models
-
-[paper](https://arxiv.org/abs/2306.08543) | [huggingface](https://huggingface.co/MiniLLM)
-
-![Method](./figures/method.png)
-
-![Results](./figures/results.png)
+# Selective Knowledge Distillation of Large Language Models
 
 ## 1 Environment
 ```bash
@@ -30,13 +24,13 @@ bash install.sh
 
 Our code is based in [this commit](https://github.com/huggingface/transformers/commit/85fde09c97213bf7e8625f83096bb2a9e183f987) of HuggingFace Transformers.
 
-Our data and pre-trained models are uploaded to our HuggingFace [repo](https://huggingface.co/MiniLLM).
+Our code is based on this [code](https://github.com/microsoft/LMOps/tree/main/minillm)
 
 ## 2 Data
 ### 2.1 Resources
-+ The training/evaluation intruction-response data before processing can be downloaded from the following links: [dolly](https://huggingface.co/datasets/MiniLLM/dolly), [self-inst](https://huggingface.co/datasets/MiniLLM/self-inst), [vicuna](https://huggingface.co/datasets/MiniLLM/Vicuna), [sinst](https://huggingface.co/datasets/MiniLLM/sinst), and [uinst](https://huggingface.co/datasets/MiniLLM/uinst)
++ The training/evaluation intruction-response data before processing can be downloaded from the following links: [dolly](https://huggingface.co/datasets/MiniLLM/dolly) and [self-inst](https://huggingface.co/datasets/MiniLLM/self-inst)
 + The plain-text corpus $\mathcal{D}_\text{PT}$ can be download from the HugginFace datasets [repository](https://huggingface.co/datasets/openwebtext). For reproducibility, we recommend you to use the following preprocessed data.
-+ The processed data can be downloaded from the following links: [dolly](https://huggingface.co/datasets/MiniLLM/dolly-processed), [openwebtext](https://huggingface.co/datasets/MiniLLM/openwebtext-processed), [roberta-corpus](https://huggingface.co/datasets/MiniLLM/roberta-corpus-processed).
++ The processed data can be downloaded from the following links: [dolly](https://huggingface.co/datasets/MiniLLM/dolly-processed), [openwebtext](https://huggingface.co/datasets/MiniLLM/openwebtext-processed), 
 
 
 ### 2.2 Data Processing
@@ -67,92 +61,34 @@ To run fine-tuning or standard KD baselines, you need to download the model chec
 
 Alternatively, you can also change the `CKPT` variable in each script to the corresponding model name to enable Transformers to download the base models automatically. For example, set `CKPT="gpt2-large"` in `scripts/gpt2/sft/sft_large.sh` causes download of the gpt2-large base model from the HugginFace model hub.
 
-**NOTE:** 
-1. LLaMA models require license and cannot be directly downloaded. 
-2. If you want to use model parallel for training, it is recommended to download the models to `checkpoints` because you need to run `tools/convert_mp.py` to change their model parallel sizes (see next section).
 
-### 3.2 Change Model Parallel Size
-You can increase/decrease the tensor parallel sizes with
+## 4 Train
+We provide example commands for GPT-2 models. Similar scripts for model families can be found in `scripts/opt` and `scripts/llama`. All our experiments are conducted on 16 \* 32V100, which can be reduced for small models.
+Some large models require tensor parallel size = 4, which is set in the scripts with `--model-parallel` and `--model-parallel-size` options.
+
+### 5.1 Baselines
+The final checkpoints are selected by the Rouge-L scores.
+#### Fine-tune the teacher model
 ```bash
-python3 tools/convert_mp.py \
-    --input_path results/llama/train/minillm/7B-init-13B-sft \
-    --source_mp_size 1 \
-    --target_mp_size 4 \
-    --model_type llama # choose from opt and llama
+bash scripts/gpt2/sft/sft_xlarge.sh /PATH/TO/MiniLLM
 ```
-To use the model with Model Parallel, we provide two example scripts for [training](https://github.com/microsoft/LMOps/tree/main/minillm/scripts/llama/sft/sft_7B_mp4.sh) and [evaluation](https://github.com/microsoft/LMOps/tree/main/minillm/scripts/llama/sft/eval_main_dolly_mp4.sh).
-
-## 4 Run Evaluation
+#### Fine-tune the student model
+```bash
+bash scripts/gpt2/sft/sft_xlarge.sh /PATH/TO/MiniLLM
+```
+#### Run distillation
+```bash
+bash scripts/gpt2/sft/sft_xlarge.sh /PATH/TO/MiniLLM
+```
+#### Eval the distillation process
+```bash
+bash scripts/gpt2/sft/sft_xlarge.sh /PATH/TO/MiniLLM
+```
+## 5 Run Evaluation
 ```bash
 bash scripts/gpt2/eval/run_eval.sh /PATH/TO/MiniLLM
 bash scripts/opt/eval/run_eval.sh /PATH/TO/MiniLLM
 bash scripts/llama/eval/run_eval.sh /PATH/TO/MiniLLM
 ```
 
-## 5 Train
-We provide example commands for GPT-2 models. Similar scripts for model families can be found in `scripts/opt` and `scripts/llama`. All our experiments are conducted on 16 \* 32V100, which can be reduced for small models.
-Some large models require tensor parallel size = 4, which is set in the scripts with `--model-parallel` and `--model-parallel-size` options.
 
-### 5.1 Baselines
-The final checkpoints are selected by the Rouge-L scores.
-#### Fine-tune the teacher models
-```bash
-bash scripts/gpt2/sft/sft_xlarge.sh /PATH/TO/MiniLLM
-```
-#### SFT Baselines
-```bash
-bash scripts/gpt2/sft/sft_base.sh /PATH/TO/MiniLLM
-bash scripts/gpt2/sft/sft_medium.sh /PATH/TO/MiniLLM
-bash scripts/gpt2/sft/sft_large.sh /PATH/TO/MiniLLM
-```
-
-#### KD Baselines
-```bash
-bash scripts/gpt2/kd/kd_base.sh /PATH/TO/MiniLLM
-bash scripts/gpt2/kd/kd_medium.sh /PATH/TO/MiniLLM
-bash scripts/gpt2/kd/kd_large.sh /PATH/TO/MiniLLM
-```
-
-#### SeqKD Baselines
-Generate and process responses with the teacher:
-```bash
-bash scripts/gpt2/tools/generate_data_seqkd.sh /PATH/TO/MiniLLM
-bash scripts/gpt2/tools/process_pseudo_data_seqkd.sh /PATH/TO/MiniLLM
-```
-Fine-tune the model with SeqKD:
-```bash
-bash scripts/gpt2/seqkd/seqkd_base.sh /PATH/TO/MiniLLM
-bash scripts/gpt2/seqkd/seqkd_medium.sh /PATH/TO/MiniLLM
-bash scripts/gpt2/seqkd/seqkd_large.sh /PATH/TO/MiniLLM
-```
-
-### 5.2 MiniLLM
-#### Initial Checkpoints
-The final checkpoints are selected by the **validation loss**.
-```bash
-bash scripts/gpt2/sft/sft_base.sh /PATH/TO/MiniLLM
-bash scripts/gpt2/sft/sft_medium.sh /PATH/TO/MiniLLM
-bash scripts/gpt2/sft/sft_large.sh /PATH/TO/MiniLLM
-```
-
-#### Train
-The final checkpoints are selected by the Rouge-L scores.
-```bash
-bash scripts/gpt2/minillm/train_base_xl.sh /PATH/TO/MiniLLM
-bash scripts/gpt2/minillm/train_medium_xl.sh /PATH/TO/MiniLLM
-bash scripts/gpt2/minillm/train_large_xl.sh /PATH/TO/MiniLLM
-```
-
-### 5.3 Multi-Node training
-Multi-Node training is launched by `deepspeed`. We provide an example script in `scripts/llama/sft/sft_7B_mn.sh` for multi-node training. Compared to single-node scripts, some of the `DISTRIBUTED_ARGS` are changed, and you need to specify a hostfile like `configs/hostfiles/node_0_1` to tell the script which nodes to use. For more information, please refer to HuggingFace's [tutorial](https://huggingface.co/docs/transformers/main_classes/deepspeed#the-deepspeed-launcher).
-
-
-## 6 Citation
-```bibtex
-@article{minillm,
-  title={Knowledge Distillation of Large Language Models},
-  author={Gu, Yuxian and Dong, Li and Wei, Furu and Huang, Minlie},
-  journal={arXiv preprint arXiv:2306.08543},
-  year={2023}
-}
-```
