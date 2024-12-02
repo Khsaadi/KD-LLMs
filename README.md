@@ -75,6 +75,11 @@ bash bash scripts/gpt2/sft/sft_xlarge.sh  /PATH/TO/KD-LLMs
 ```bash
 bash scripts/gpt2/sft/sft_base.sh /PATH/TO/KD-LLMs
 ```
+#### Before distillation 
+Fine-tune the student model for 3 epochs and choose the chekpoint that has the lowest validation loss. Use this student model as your initialization for the distillation. Create a folder named minillm_init inside ./results and put the resulted model inside it.
+```bash
+bash scripts/gpt2/sft/sft_base.sh /PATH/TO/KD-LLMs
+```
 #### Run distillation
 ```bash
 bash scripts/gpt2/minillm/train_base_xl.sh /PATH/TO/KD-LLMs
