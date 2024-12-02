@@ -63,8 +63,7 @@ Alternatively, you can also change the `CKPT` variable in each script to the cor
 
 
 ## 4 Train
-We provide example commands for GPT-2 models. Similar scripts for model families can be found in `scripts/opt` and `scripts/llama`. All our experiments are conducted on 16 \* 32V100, which can be reduced for small models.
-Some large models require tensor parallel size = 4, which is set in the scripts with `--model-parallel` and `--model-parallel-size` options.
+All our experiments are conducted on 1 \* A100 for about 12 hours.
 
 ### 5.1 Baselines
 The final checkpoints are selected by the Rouge-L scores.
