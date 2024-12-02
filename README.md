@@ -63,25 +63,26 @@ Alternatively, you can also change the `CKPT` variable in each script to the cor
 
 
 ## 4 Train
-All our experiments are conducted on 1 \* A100 each for about 13 hours.
+All our experiments are conducted on 1 \* A100 each for about 13 hours. You can set the hyper-parameters in each .sh script.
 
-### 5.1 Baselines
+### Baselines
 The final checkpoints are selected by the Rouge-L scores.
 #### Fine-tune the teacher model
 ```bash
-bash scripts/gpt2/sft/sft_xlarge.sh /PATH/TO/MiniLLM
+bash bash scripts/gpt2/sft/sft_xlarge.sh  /PATH/TO/KD-LLMs
 ```
 #### Fine-tune the student model
 ```bash
-bash scripts/gpt2/sft/sft_xlarge.sh /PATH/TO/MiniLLM
+bash scripts/gpt2/sft/sft_base.sh /PATH/TO/KD-LLMs
 ```
 #### Run distillation
 ```bash
-bash scripts/gpt2/sft/sft_xlarge.sh /PATH/TO/MiniLLM
+bash scripts/gpt2/minillm/train_base_xl.sh /PATH/TO/KD-LLMs
 ```
 ## 5 Run Evaluation
+Before running the evaluation, create a directory called gpt2-base and put your final distilled model inside it.
 ```bash
-bash scripts/gpt2/eval/run_eval.sh /PATH/TO/MiniLLM
+bash scripts/gpt2/eval/run_eval.sh /PATH/TO/KD-LLMs
 ```
 
 
