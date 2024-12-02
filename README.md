@@ -63,7 +63,7 @@ Alternatively, you can also change the `CKPT` variable in each script to the cor
 
 
 ## 4 Train
-All our experiments are conducted on 1 \* A100 for about 12 hours.
+All our experiments are conducted on 1 \* A100 each for about 13 hours.
 
 ### 5.1 Baselines
 The final checkpoints are selected by the Rouge-L scores.
@@ -79,15 +79,9 @@ bash scripts/gpt2/sft/sft_xlarge.sh /PATH/TO/MiniLLM
 ```bash
 bash scripts/gpt2/sft/sft_xlarge.sh /PATH/TO/MiniLLM
 ```
-#### Eval the distillation process
-```bash
-bash scripts/gpt2/sft/sft_xlarge.sh /PATH/TO/MiniLLM
-```
 ## 5 Run Evaluation
 ```bash
 bash scripts/gpt2/eval/run_eval.sh /PATH/TO/MiniLLM
-bash scripts/opt/eval/run_eval.sh /PATH/TO/MiniLLM
-bash scripts/llama/eval/run_eval.sh /PATH/TO/MiniLLM
 ```
 
 
